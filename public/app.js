@@ -99,26 +99,6 @@
     return '';
   }
 
-  async function probeSameOriginBackend() {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 1500);
-    try {
-      const response = await fetch(`${window.location.origin}/api/status`, {
-        cache: 'no-store',
-        signal: controller.signal
-      });
-      if (!response.ok) return false;
-      const contentType = response.headers.get('content-type') || '';
-      if (!contentType.includes('application/json')) return false;
-      const body = await response.json();
-      return Boolean(body && body.server === 'running');
-    } catch (_) {
-      return false;
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
   async function resolveBackendUrl() {
     const saved = normalizeBaseUrl(window.localStorage.getItem(BACKEND_URL_KEY) || '');
     if (saved) return { url: saved, source: 'saved' };
@@ -126,9 +106,10 @@
     const fixed = normalizeBaseUrl(runtimeConfig.backendUrl || '');
     if (fixed) return { url: fixed, source: 'config' };
 
-    // If this page is being served by the Node backend itself, keep using the
-    // same origin instead of sending traffic through the public tunnel.
-    if (await probeSameOriginBackend()) {
+    // Local development is normally served directly by the Node backend.
+    // A hosted frontend (Vercel / niat.tech) must use the discovered tunnel.
+    const localHost = /^(localhost|127\.0\.0\.1|\[::1\])$/i.test(window.location.hostname);
+    if (localHost) {
       return { url: window.location.origin, source: 'same-origin-live' };
     }
 
