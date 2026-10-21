@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101827">
+  <meta name="description" content="Sign in to the private MQTT workspace.">
+  <title>HomeLink · MQTT Workspace</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/config.js" defer></script>
+  <script src="/socket.io.min.js" defer></script>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="ambient ambient-one"></div>
+  <div class="ambient ambient-two"></div>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="HomeLink home">
+      <span class="brand-mark"><span></span><span></span><span></span></span>
+      <span>HomeLink<span class="brand-period">.</span></span>
+    </a>
+    <div class="topbar-right"><span class="topbar-dot"></span><span>Private MQTT workspace</span></div>
+  </header>
+
+  <main class="page-shell">
+    <section id="auth-view" class="auth-layout">
+      <div class="intro-panel">
+        <div class="eyebrow"><span class="eyebrow-line"></span> YOUR DEVICES, CONNECTED</div>
+        <h1>A clearer view of your <span>connected home.</span></h1>
+        <p class="intro-copy">Create an account, then wait for an administrator to approve it. Only approved accounts can sign in or use device messaging.</p>
+        <div class="feature-list">
+          <div class="feature-item"><span class="feature-icon">↔</span><div><strong>Live message flow</strong><small>Publish and watch messages in real time.</small></div></div>
+          <div class="feature-item"><span class="feature-icon">✓</span><div><strong>Approval protected</strong><small>MQTT access is enabled only after approval.</small></div></div>
+          <div class="feature-item"><span class="feature-icon">⌂</span><div><strong>Your own broker</strong><small>Messages travel through your laptop's Mosquitto broker.</small></div></div>
+        </div>
+        <div class="connection-note"><span class="pulse-dot"></span><span>Backend connection is checked after sign-in</span></div>
+      </div>
+
+      <div class="auth-card panel">
+        <div class="card-kicker">WELCOME TO HOMELINK</div>
+        <h2 id="auth-title">Sign in</h2>
+        <p id="auth-subtitle" class="muted">Use your account to continue to the workspace.</p>
+        <div class="auth-switch" role="tablist" aria-label="Account action">
+          <button id="mode-signin" class="switch-button active" type="button" role="tab" aria-selected="true">Sign in</button>
+          <button id="mode-signup" class="switch-button" type="button" role="tab" aria-selected="false">Create account</button>
+        </div>
+        <form id="auth-form" class="form-stack">
+          <label for="email">Email address</label>
+          <input id="email" name="email" type="email" autocomplete="email" placeholder="you@example.com" required>
+          <div class="label-row"><label for="password">Password</label><span class="field-hint">At least 8 characters</span></div>
+          <input id="password" name="password" type="password" autocomplete="current-password" minlength="8" placeholder="Enter your password" required>
+          <button id="auth-submit" class="button button-primary button-wide" type="submit"><span>Sign in</span><span aria-hidden="true">→</span></button>
+        </form>
+        <div id="auth-message" class="notice hidden" role="status" aria-live="polite"></div>
+        <p class="auth-footnote">No email is sent. After registering, your application stays pending until an administrator approves it here. Try signing in again later to check your status.</p>
+        <button id="backend-toggle" class="backend-toggle" type="button">Connection settings · <span id="backend-label">checking…</span></button>
+        <form id="backend-form" class="backend-form hidden">
+          <label for="backend-url">Backend URL</label>
+          <input id="backend-url" type="url" placeholder="https://example.trycloudflare.com" autocomplete="url">
+          <div class="backend-actions">
+            <button class="button button-outline button-small" type="submit">Save &amp; reload</button>
+            <button id="backend-reset" class="button button-quiet button-small" type="button">Use automatic</button>
+          </div>
+          <p id="backend-message" class="field-hint"></p>
+        </form>
+      </div>
+    </section>
+
+    <section id="workspace-view" class="workspace hidden">
+      <div class="workspace-heading">
+        <div><div class="eyebrow"><span class="eyebrow-line"></span> WORKSPACE</div><h1>Your control room.</h1><p class="muted">Your identity, access approval and broker connection in one place.</p></div>
+        <div class="account-box"><div class="avatar" id="user-avatar">U</div><div class="account-text"><strong id="user-email">Loading account…</strong><span id="user-role">Account</span></div><button id="signout-button" class="button button-quiet" type="button">Sign out</button></div>
+      </div>
+
+      <div id="state-banner" class="state-banner">
+        <div class="state-symbol" id="state-symbol">…</div><div class="state-copy"><strong id="state-title">Checking your access</strong><p id="state-description">Verifying your account with the backend.</p></div><button id="refresh-access" class="button button-outline" type="button">Check again</button>
+      </div>
+
+      <section id="mqtt-panel" class="panel radio-panel hidden">
+        <div class="section-heading"><div><div class="card-kicker">MQTT AIRWAVES</div><h2>Tune the dial</h2><p class="muted">Each station is an MQTT topic filter. Tuning changes the broker subscription for your own session.</p></div><div id="broker-status" class="status-pill status-offline"><span class="status-dot"></span><span>Checking broker</span></div></div>
+
+        <div class="radio-deck">
+          <div class="tuner-card">
+            <div class="tuner-meta"><span class="on-air"><span class="on-air-dot"></span> ON AIR</span><span id="tuner-status">Waiting for connection…</span></div>
+            <div class="frequency-readout"><span id="frequency-value">88.1</span><span class="frequency-unit">FM</span></div>
+            <div class="station-title" id="station-name">Scan all stations</div>
+            <div class="station-topic">Topic filter <code id="station-topic">home/#</code></div>
+            <input id="frequency-dial" class="frequency-dial" type="range" min="88" max="108" step="0.1" value="88.1" aria-label="Tune MQTT frequency">
+            <div class="dial-scale" aria-hidden="true"><span>88</span><span>92</span><span>96</span><span>100</span><span>104</span><span>108</span></div>
+            <div class="tuner-actions">
+              <button id="scan-all" class="button button-quiet button-small" type="button">⌁ Scan all</button>
+              <button id="toggle-custom" class="button button-outline button-small" type="button">+ Custom station</button>
+            </div>
+            <div id="signal-meter" class="signal-meter" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span></div>
+          </div>
+
+          <div class="preset-card">
+            <div class="preset-heading"><strong>Preset stations</strong><small>Click a preset or drag the dial. Add your own frequency below.</small></div>
+            <div id="station-list" class="station-list"></div>
+          </div>
+        </div>
+
+        <form id="custom-station-form" class="custom-station hidden">
+          <div class="custom-field"><label for="custom-frequency">Frequency</label><input id="custom-frequency" type="number" min="88" max="108" step="0.1" placeholder="99.5" required></div>
+          <div class="custom-field"><label for="custom-name">Station name</label><input id="custom-name" maxlength="28" placeholder="Garage" required></div>
+          <div class="custom-field custom-grow"><label for="custom-topic">Topic filter</label><input id="custom-topic" maxlength="128" placeholder="home/garage/#" required></div>
+          <button class="button button-primary button-small" type="submit">Add station</button>
+          <p id="custom-message" class="inline-message" role="status"></p>
+        </form>
+
+        <div class="mqtt-grid">
+          <form id="publish-form" class="publish-form">
+            <div class="publish-heading"><strong>Transmit</strong><small>Broadcast a message to the topic below.</small></div>
+            <label for="topic">Publish topic</label><input id="topic" name="topic" value="home/test" maxlength="128" required>
+            <div class="field-hint topic-hint">Topics must begin with <code>home/</code>. Wildcards cannot be used when publishing.</div>
+            <label for="message">Message</label><textarea id="message" name="message" rows="4" maxlength="1000" placeholder="Type a test message…" required></textarea>
+            <button id="publish-button" class="button button-primary" type="submit">Broadcast <span aria-hidden="true">↗</span></button>
+            <div id="publish-message" class="inline-message" role="status"></div>
+          </form>
+          <div class="feed-panel"><div class="feed-heading"><div><strong>Receiver</strong><small>Now receiving on <code id="feed-topic">home/#</code></small></div><button id="clear-feed" class="button button-quiet button-small" type="button">Clear</button></div><div id="message-feed" class="message-feed"><div class="empty-feed"><span class="empty-feed-icon">⌁</span><strong>Waiting for a signal</strong><span>Tune a station, publish a message, or use another MQTT client.</span></div></div></div>
+        </div>
+        <p class="radio-note"><strong>How it works:</strong> every station is an MQTT topic filter. <code>+</code> matches one level and <code>#</code> matches every level below it. For example, <code>home/kitchen/#</code> receives every message under the kitchen, while <code>home/+/status</code> receives one status topic per room. Tuning submits an actual subscribe/unsubscribe to your Mosquitto broker.</p>
+      </section>
+
+      <section id="admin-panel" class="panel admin-panel hidden">
+        <div class="section-heading"><div><div class="card-kicker">ADMINISTRATION</div><h2>Access requests</h2><p class="muted">Review who can access the MQTT workspace.</p></div><button id="reload-users" class="button button-outline" type="button">↻ Refresh list</button></div>
+        <div class="admin-toolbar"><div class="stat-card"><span>Loaded accounts</span><strong id="stat-total">—</strong></div><div class="stat-card"><span>Pending review</span><strong id="stat-pending">—</strong></div><div class="stat-card"><span>Approved</span><strong id="stat-approved">—</strong></div><div class="filter-box"><label for="user-filter">Show</label><select id="user-filter"><option value="pending">Pending</option><option value="all">All accounts</option><option value="approved">Approved</option><option value="rejected">Rejected</option></select></div></div>
+        <div id="admin-message" class="notice hidden" role="status" aria-live="polite"></div>
+        <div class="table-wrap"><table><thead><tr><th>Account</th><th>Status</th><th>Requested</th><th>Last reviewed</th><th>Action</th></tr></thead><tbody id="users-table-body"><tr><td colspan="5" class="table-empty">Loading access requests…</td></tr></tbody></table></div>
+        <p class="table-note">This view shows up to the latest 200 access records. Admin API permissions are enforced by the backend, not just by this page.</p>
+      </section>
+      <footer class="workspace-footer"><span>HomeLink · Private MQTT workspace</span><span>Do not share your password or access token.</span></footer>
+    </section>
+  </main>
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+</body>
+</html>

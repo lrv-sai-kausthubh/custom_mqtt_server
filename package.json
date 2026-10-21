@@ -1,0 +1,24 @@
+{
+  "name": "mqtt-home-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Express backend that bridges locally approved users to a private Mosquitto MQTT broker",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.57.4",
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.8",
+    "express": "^5.3.0",
+    "mongoose": "^9.11.2",
+    "mqtt": "^5.10.4",
+    "socket.io": "^4.8.1"
+  }
+}
