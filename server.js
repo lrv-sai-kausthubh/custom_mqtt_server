@@ -648,12 +648,41 @@ mqttClient.on("error", (error) => {
 });
 mqttClient.on("close", () => io.emit("mqtt-status", "disconnected"));
 
+// Mosquitto delivers one copy per matching subscription when the same client
+// has overlapping filters (for example "home/#" and "home/test"). Keep a very
+// short-lived fingerprint so each broker message is routed to the browser once.
+const recentBrokerMessages = new Map();
+const BROKER_DUPLICATE_WINDOW_MS = 100;
+const BROKER_DUPLICATE_CACHE_LIMIT = 500;
+
+function isDuplicateBrokerMessage(topic, message) {
+  const now = Date.now();
+  const key = `${topic}\u0000${message}`;
+  const previous = recentBrokerMessages.get(key);
+  if (previous !== undefined && now - previous < BROKER_DUPLICATE_WINDOW_MS) {
+    return true;
+  }
+
+  recentBrokerMessages.set(key, now);
+  if (recentBrokerMessages.size > BROKER_DUPLICATE_CACHE_LIMIT) {
+    for (const [cachedKey, seenAt] of recentBrokerMessages) {
+      if (now - seenAt >= BROKER_DUPLICATE_WINDOW_MS) recentBrokerMessages.delete(cachedKey);
+    }
+    while (recentBrokerMessages.size > BROKER_DUPLICATE_CACHE_LIMIT) {
+      recentBrokerMessages.delete(recentBrokerMessages.keys().next().value);
+    }
+  }
+  return false;
+}
+
 // Route each broker message only to sockets whose tuned filter matches it.
 mqttClient.on("message", (topic, payload) => {
   if (topicSubscriptions.size === 0) return;
+  const message = payload.toString();
+  if (isDuplicateBrokerMessage(topic, message)) return;
   const entry = {
     topic,
-    message: payload.toString(),
+    message,
     receivedAt: new Date().toISOString(),
   };
 
