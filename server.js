@@ -47,6 +47,112 @@ required("SUPABASE_SECRET_KEY", SUPABASE_SECRET_KEY);
 required("MQTT_USERNAME", MQTT_USERNAME);
 required("MQTT_PASSWORD", MQTT_PASSWORD);
 
+// ---------------------------------------------------------------
+// Console logging
+// ---------------------------------------------------------------
+// Set LOG_LEVEL=debug in .env to also see Socket.IO polling requests,
+// successful auth checks, and suppressed duplicate MQTT messages.
+const LOG_LEVELS = { debug: 10, info: 20, warn: 30, error: 40, none: 100 };
+const LOG_LEVEL_NAME = String(process.env.LOG_LEVEL || "info").toLowerCase();
+const LOG_LEVEL = Object.prototype.hasOwnProperty.call(LOG_LEVELS, LOG_LEVEL_NAME)
+  ? LOG_LEVELS[LOG_LEVEL_NAME]
+  : LOG_LEVELS.info;
+
+function logTimestamp() {
+  return new Date().toISOString();
+}
+
+function logValue(value) {
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+  if (typeof value === "string") {
+    if (value === "") return '""';
+    const cleaned = value.replace(/[\r\n\t]+/g, " ");
+    return /[\s"=]/.test(cleaned) ? JSON.stringify(cleaned) : cleaned;
+  }
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") {
+    return String(value);
+  }
+  try {
+    return JSON.stringify(value);
+  } catch (_error) {
+    return String(value);
+  }
+}
+
+function writeLog(level, event, details = {}) {
+  if (LOG_LEVELS[level] < LOG_LEVEL) return;
+  const parts = [`[${logTimestamp()}]`, level.toUpperCase().padEnd(5), event];
+  for (const [key, value] of Object.entries(details)) {
+    if (value !== undefined) parts.push(`${key}=${logValue(value)}`);
+  }
+  const line = parts.join(" ");
+  if (level === "error") console.error(line);
+  else if (level === "warn") console.warn(line);
+  else console.log(line);
+}
+
+function logDebug(event, details) {
+  writeLog("debug", event, details);
+}
+
+function logInfo(event, details) {
+  writeLog("info", event, details);
+}
+
+function logWarn(event, details) {
+  writeLog("warn", event, details);
+}
+
+function logError(event, details) {
+  writeLog("error", event, details);
+}
+
+function previewText(value, maxLength = 200) {
+  const text = String(value ?? "");
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength)}...(${text.length} chars)`;
+}
+
+function requestIp(req) {
+  const headers = req.headers || {};
+  const cfIp = headers["cf-connecting-ip"];
+  if (typeof cfIp === "string" && cfIp.trim()) return cfIp.trim();
+  const forwarded = headers["x-forwarded-for"];
+  if (typeof forwarded === "string" && forwarded.trim()) return forwarded.split(",")[0].trim();
+  try {
+    if (req.ip) return req.ip;
+  } catch (_error) {
+    // Fall through to the socket address.
+  }
+  return (req.socket && req.socket.remoteAddress) || "unknown";
+}
+
+function socketIp(socket) {
+  const headers = socket.handshake.headers || {};
+  const forwarded = headers["x-forwarded-for"];
+  if (typeof forwarded === "string" && forwarded.trim()) return forwarded.split(",")[0].trim();
+  const cfIp = headers["cf-connecting-ip"];
+  if (typeof cfIp === "string" && cfIp.trim()) return cfIp.trim();
+  return socket.handshake.address || "unknown";
+}
+
+function redactUrl(value) {
+  try {
+    const url = new URL(String(value));
+    if (url.username) url.username = "***";
+    if (url.password) url.password = "***";
+    return url.toString();
+  } catch (_error) {
+    return String(value);
+  }
+}
+
+function userLabel(user) {
+  if (!user) return "anonymous";
+  return user.email || user.id || "unknown";
+}
+
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map((origin) => origin.trim())
@@ -57,6 +163,14 @@ const app = express();
 const server = http.createServer(app);
 // The Cloudflare Tunnel connects from loopback, so its forwarded client IP is trusted.
 app.set("trust proxy", "loopback");
+
+// Attach a short request id early so auth logs and the access log line can be
+// matched together.
+app.use((req, _res, next) => {
+  req.logId = req.logId || crypto.randomBytes(4).toString("hex");
+  next();
+});
+
 const socketOptions = {};
 if (allowAllOrigins) {
   socketOptions.cors = { origin: true, methods: ["GET", "POST"] };
@@ -100,6 +214,42 @@ if (allowAllOrigins) {
 }
 
 app.use(express.json({ limit: "16kb" }));
+
+// Log every HTTP request that reaches this machine, including Cloudflare-
+// forwarded API calls, static files, and Socket.IO polling transports.
+server.on("request", (req, res) => {
+  const startedAt = process.hrtime.bigint();
+  req.logId = req.logId || crypto.randomBytes(4).toString("hex");
+  const isSocketIo = (req.url || "").startsWith("/socket.io/");
+  let finished = false;
+
+  const writeRequestLog = (event) => {
+    if (finished) return;
+    finished = true;
+    const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+    const identity = req.identity && req.identity.user;
+    const details = {
+      id: req.logId,
+      method: req.method,
+      path: req.originalUrl || req.url,
+      status: res.statusCode,
+      durationMs: Math.round(durationMs * 10) / 10,
+      bytes: res.getHeader("content-length") || undefined,
+      ip: requestIp(req),
+      user: userLabel(identity),
+      userId: identity ? identity.id : undefined,
+      origin: req.headers.origin || "-",
+      ua: previewText(req.headers["user-agent"] || "-", 120),
+    };
+    if (isSocketIo) logDebug(event, details);
+    else logInfo(event, details);
+  };
+
+  res.on("finish", () => writeRequestLog("http_request"));
+  res.on("close", () => {
+    if (!res.writableEnded) writeRequestLog("http_request_aborted");
+  });
+});
 
 // Serve the login page and dashboard from the same origin as this API.
 app.use(express.static(PUBLIC_DIR));
@@ -239,7 +389,7 @@ async function loadUserById(userId) {
     .maybeSingle();
 
   if (error) {
-    console.error("Failed to read account:", error.message);
+    logError("database_read_user_failed", { userId, error: error.message });
     throw httpError(503, "Could not read the account record.");
   }
   return data || null;
@@ -250,7 +400,7 @@ async function deleteSessionByToken(token) {
     .from(SESSIONS_TABLE)
     .delete()
     .eq("token_hash", hashSessionToken(token));
-  if (error) console.error("Failed to delete session:", error.message);
+  if (error) logError("database_delete_session_failed", { error: error.message });
 }
 
 async function createSession(userId) {
@@ -271,7 +421,7 @@ async function createSession(userId) {
   });
 
   if (error) {
-    console.error("Failed to create session:", error.message);
+    logError("database_create_session_failed", { userId, error: error.message });
     throw httpError(503, "Could not create a sign-in session.");
   }
 
@@ -288,7 +438,7 @@ async function loadSessionIdentity(token) {
     .maybeSingle();
 
   if (error) {
-    console.error("Failed to verify session:", error.message);
+    logError("database_verify_session_failed", { error: error.message });
     throw httpError(503, "Could not verify your session.");
   }
   if (!sessionRow) {
@@ -318,22 +468,55 @@ async function loadSessionIdentity(token) {
 async function authenticateHttp(req, res, next) {
   const token = getBearerToken(req);
   if (!token) {
+    logWarn("http_auth_missing_token", {
+      id: req.logId,
+      method: req.method,
+      path: req.originalUrl || req.url,
+      ip: requestIp(req),
+    });
     return res.status(401).json({ error: "Sign in first; a session token is required." });
   }
 
   try {
     req.identity = await loadSessionIdentity(token);
+    logDebug("http_auth_success", {
+      id: req.logId,
+      method: req.method,
+      path: req.originalUrl || req.url,
+      ip: requestIp(req),
+      user: userLabel(req.identity.user),
+      userId: req.identity.user.id,
+    });
     return next();
   } catch (error) {
+    const status = error.statusCode || 503;
+    logWarn("http_auth_failed", {
+      id: req.logId,
+      method: req.method,
+      path: req.originalUrl || req.url,
+      ip: requestIp(req),
+      status,
+      reason: error.message || "Authentication failed.",
+    });
     const body = { error: error.message || "Authentication failed." };
     if (error.accountStatus) body.status = error.accountStatus;
-    return res.status(error.statusCode || 503).json(body);
+    return res.status(status).json(body);
   }
 }
 
 function requireApproved(req, res, next) {
   const user = req.identity && req.identity.user;
   if (!user || user.status !== "approved") {
+    logWarn("http_access_denied", {
+      id: req.logId,
+      method: req.method,
+      path: req.originalUrl || req.url,
+      ip: requestIp(req),
+      user: userLabel(user),
+      userId: user ? user.id : undefined,
+      status: user ? user.status : "anonymous",
+      reason: "account_not_approved",
+    });
     return res.status(403).json({
       error: "Your account has not been approved for MQTT access.",
       status: user ? user.status : "pending",
@@ -345,6 +528,15 @@ function requireApproved(req, res, next) {
 function requireAdmin(req, res, next) {
   const user = req.identity && req.identity.user;
   if (!user || user.status !== "approved" || user.role !== "admin") {
+    logWarn("http_admin_denied", {
+      id: req.logId,
+      method: req.method,
+      path: req.originalUrl || req.url,
+      ip: requestIp(req),
+      user: userLabel(user),
+      userId: user ? user.id : undefined,
+      role: user ? user.role : "anonymous",
+    });
     return res.status(403).json({ error: "Administrator access is required." });
   }
   return next();
@@ -365,11 +557,25 @@ app.post("/api/auth/register", async (req, res, next) => {
   try {
     const email = normalizeEmail(req.body && req.body.email);
     const password = typeof (req.body && req.body.password) === "string" ? req.body.password : "";
+    logInfo("auth_register_attempt", {
+      id: req.logId,
+      email: email || "(empty)",
+      ip: requestIp(req),
+      ua: previewText(req.headers["user-agent"] || "-", 120),
+    });
 
     if (!isValidEmail(email)) {
+      logWarn("auth_register_rejected", { id: req.logId, email: email || "(empty)", ip: requestIp(req), reason: "invalid_email" });
       return res.status(400).json({ error: "Enter a valid email address." });
     }
     if (password.length < PASSWORD_MIN_LENGTH || password.length > PASSWORD_MAX_LENGTH) {
+      logWarn("auth_register_rejected", {
+        id: req.logId,
+        email,
+        ip: requestIp(req),
+        reason: "invalid_password_length",
+        passwordLength: password.length,
+      });
       return res.status(400).json({
         error: `Password must be between ${PASSWORD_MIN_LENGTH} and ${PASSWORD_MAX_LENGTH} characters.`,
       });
@@ -377,6 +583,7 @@ app.post("/api/auth/register", async (req, res, next) => {
 
     const registerKey = authKey(req, "register");
     if (isThrottled(registerKey, 20)) {
+      logWarn("auth_register_throttled", { id: req.logId, email, ip: requestIp(req) });
       return res.status(429).json({
         error: "Too many accounts were created from this connection. Please try again later.",
       });
@@ -397,15 +604,23 @@ app.post("/api/auth/register", async (req, res, next) => {
     if (error) {
       // 23505 = unique violation (the email already has an account).
       if (error.code === "23505") {
+        logWarn("auth_register_rejected", { id: req.logId, email, ip: requestIp(req), reason: "email_exists" });
         return res.status(409).json({
           error: "An account already exists for that email. Try signing in instead.",
         });
       }
-      console.error("Failed to register account:", error.message);
+      logError("auth_register_failed", { id: req.logId, email, ip: requestIp(req), error: error.message });
       throw httpError(503, "Could not create the account.");
     }
 
     recordFailure(registerKey, 60 * 60 * 1000);
+    logInfo("auth_register_created", {
+      id: req.logId,
+      email,
+      userId: data.id,
+      status: data.status,
+      ip: requestIp(req),
+    });
 
     return res.status(201).json({
       status: data.status,
@@ -421,16 +636,25 @@ app.post("/api/auth/login", async (req, res, next) => {
   try {
     const email = normalizeEmail(req.body && req.body.email);
     const password = typeof (req.body && req.body.password) === "string" ? req.body.password : "";
+    logInfo("auth_login_attempt", {
+      id: req.logId,
+      email: email || "(empty)",
+      ip: requestIp(req),
+      ua: previewText(req.headers["user-agent"] || "-", 120),
+    });
 
     if (!isValidEmail(email) || password.length === 0) {
+      logWarn("auth_login_rejected", { id: req.logId, email: email || "(empty)", ip: requestIp(req), reason: "missing_credentials" });
       return res.status(400).json({ error: "Enter your email address and password." });
     }
     if (password.length > PASSWORD_MAX_LENGTH) {
+      logWarn("auth_login_rejected", { id: req.logId, email, ip: requestIp(req), reason: "password_too_long" });
       return res.status(400).json({ error: "Email or password is incorrect." });
     }
 
     const loginKey = authKey(req, "login", email);
     if (isThrottled(loginKey, 20)) {
+      logWarn("auth_login_throttled", { id: req.logId, email, ip: requestIp(req) });
       return res.status(429).json({
         error: "Too many failed sign-in attempts. Please wait a few minutes and try again.",
       });
@@ -443,19 +667,21 @@ app.post("/api/auth/login", async (req, res, next) => {
       .maybeSingle();
 
     if (error) {
-      console.error("Failed to read account during sign-in:", error.message);
+      logError("auth_login_lookup_failed", { id: req.logId, email, ip: requestIp(req), error: error.message });
       throw httpError(503, "Could not sign in right now.");
     }
 
     const passwordMatches = user ? await verifyPassword(password, user.password_hash) : false;
     if (!user || !passwordMatches) {
       recordFailure(loginKey, 15 * 60 * 1000);
+      logWarn("auth_login_failed", { id: req.logId, email, ip: requestIp(req), reason: "invalid_credentials" });
       return res.status(401).json({ error: "Email or password is incorrect." });
     }
 
     clearFailures(loginKey);
 
     if (user.status === "pending") {
+      logWarn("auth_login_blocked", { id: req.logId, email, userId: user.id, ip: requestIp(req), status: user.status });
       return res.status(403).json({
         error:
           "Your application is still pending administrator approval. You cannot sign in until it is approved. No email is sent; try signing in again later.",
@@ -463,6 +689,7 @@ app.post("/api/auth/login", async (req, res, next) => {
       });
     }
     if (user.status !== "approved") {
+      logWarn("auth_login_blocked", { id: req.logId, email, userId: user.id, ip: requestIp(req), status: user.status });
       return res.status(403).json({
         error: "Your account does not have access. Contact the administrator if you believe this is a mistake.",
         status: user.status,
@@ -470,6 +697,14 @@ app.post("/api/auth/login", async (req, res, next) => {
     }
 
     const session = await createSession(user.id);
+    logInfo("auth_login_success", {
+      id: req.logId,
+      email: user.email,
+      userId: user.id,
+      role: user.role,
+      ip: requestIp(req),
+      expiresAt: session.expiresAt,
+    });
     return res.json({
       token: session.token,
       expiresAt: session.expiresAt,
@@ -484,7 +719,14 @@ app.post("/api/auth/login", async (req, res, next) => {
 
 app.post("/api/auth/logout", authenticateHttp, async (req, res, next) => {
   try {
+    const { user } = req.identity;
     await deleteSessionByToken(getBearerToken(req));
+    logInfo("auth_logout", {
+      id: req.logId,
+      user: userLabel(user),
+      userId: user.id,
+      ip: requestIp(req),
+    });
     return res.status(204).end();
   } catch (error) {
     return next(error);
@@ -494,6 +736,14 @@ app.post("/api/auth/logout", authenticateHttp, async (req, res, next) => {
 // Any signed-in, approved user can see their own account state.
 app.get("/api/access/me", authenticateHttp, requireApproved, (req, res) => {
   const { user } = req.identity;
+  logDebug("access_check", {
+    id: req.logId,
+    user: userLabel(user),
+    userId: user.id,
+    ip: requestIp(req),
+    status: user.status,
+    role: user.role,
+  });
   res.json({
     user: { id: user.id, email: user.email || null },
     status: user.status,
@@ -507,6 +757,13 @@ app.get("/api/admin/users", authenticateHttp, requireAdmin, async (req, res, nex
     const requestedStatus = req.query.status;
     const allowedStatuses = new Set(["pending", "approved", "rejected"]);
     if (requestedStatus && !allowedStatuses.has(requestedStatus)) {
+      logWarn("admin_users_list_rejected", {
+        id: req.logId,
+        admin: userLabel(req.identity.user),
+        ip: requestIp(req),
+        reason: "invalid_status_filter",
+        filter: String(requestedStatus),
+      });
       return res.status(400).json({ error: "status must be pending, approved, or rejected." });
     }
 
@@ -518,7 +775,24 @@ app.get("/api/admin/users", authenticateHttp, requireAdmin, async (req, res, nex
     if (requestedStatus) query = query.eq("status", requestedStatus);
 
     const { data, error } = await query;
-    if (error) throw error;
+    if (error) {
+      logError("admin_users_list_failed", {
+        id: req.logId,
+        admin: userLabel(req.identity.user),
+        ip: requestIp(req),
+        error: error.message,
+      });
+      throw error;
+    }
+
+    logInfo("admin_users_list", {
+      id: req.logId,
+      admin: userLabel(req.identity.user),
+      adminId: req.identity.user.id,
+      ip: requestIp(req),
+      filter: requestedStatus || "all",
+      count: (data || []).length,
+    });
 
     return res.json({
       users: (data || []).map((row) => ({ ...row, user_id: row.id })),
@@ -537,13 +811,25 @@ app.patch(
     try {
       const { userId } = req.params;
       const { status } = req.body || {};
+      logInfo("admin_user_approval_attempt", {
+        id: req.logId,
+        admin: userLabel(req.identity.user),
+        adminId: req.identity.user.id,
+        targetUserId: userId,
+        requestedStatus: status,
+        ip: requestIp(req),
+      });
+
       if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(userId)) {
+        logWarn("admin_user_approval_rejected", { id: req.logId, reason: "invalid_user_id", targetUserId: userId });
         return res.status(400).json({ error: "userId must be a valid UUID." });
       }
       if (!["approved", "rejected"].includes(status)) {
+        logWarn("admin_user_approval_rejected", { id: req.logId, reason: "invalid_status", targetUserId: userId, requestedStatus: status });
         return res.status(400).json({ error: "status must be approved or rejected." });
       }
       if (userId === req.identity.user.id && status !== "approved") {
+        logWarn("admin_user_approval_rejected", { id: req.logId, reason: "self_revoke", targetUserId: userId });
         return res.status(400).json({ error: "You cannot revoke your own administrator account here." });
       }
 
@@ -554,19 +840,52 @@ app.patch(
         .select("id, email, status, role, reviewed_at")
         .maybeSingle();
 
-      if (error) throw error;
-      if (!data) return res.status(404).json({ error: "No account found for that user." });
+      if (error) {
+        logError("admin_user_approval_failed", {
+          id: req.logId,
+          admin: userLabel(req.identity.user),
+          targetUserId: userId,
+          requestedStatus: status,
+          error: error.message,
+        });
+        throw error;
+      }
+      if (!data) {
+        logWarn("admin_user_approval_rejected", { id: req.logId, reason: "user_not_found", targetUserId: userId });
+        return res.status(404).json({ error: "No account found for that user." });
+      }
 
+      let revokedSockets = 0;
       // A revoked user must not keep an existing session or an already-open WebSocket.
       if (status !== "approved") {
         await supabaseAdmin.from(SESSIONS_TABLE).delete().eq("user_id", userId);
         for (const socket of io.sockets.sockets.values()) {
           if (socket.data.userId === userId) {
+            revokedSockets += 1;
+            logInfo("socket_access_revoked", {
+              socketId: socket.id,
+              user: socket.data.userEmail || userLabel(data),
+              userId,
+              ip: socketIp(socket),
+              status,
+            });
             socket.emit("access-revoked", { status });
             socket.disconnect(true);
           }
         }
       }
+
+      logInfo("admin_user_approval", {
+        id: req.logId,
+        admin: userLabel(req.identity.user),
+        adminId: req.identity.user.id,
+        targetUserId: data.id,
+        targetEmail: data.email,
+        status: data.status,
+        revokedSockets,
+        ip: requestIp(req),
+      });
+
       return res.json({ user: { ...data, user_id: data.id } });
     } catch (error) {
       return next(error);
@@ -591,16 +910,27 @@ const topicSubscriptions = new Map();
 function subscribeBrokerFilter(filter) {
   if (!mqttClient.connected) return;
   mqttClient.subscribe(filter, { qos: 0 }, (error) => {
-    if (error) console.error(`MQTT subscribe failed for ${filter}:`, error.message);
-    else console.log(`Subscribed to ${filter}.`);
+    if (error) {
+      logError("mqtt_subscribe_failed", { filter, error: error.message });
+    } else {
+      const subscribers = topicSubscriptions.get(filter);
+      logInfo("mqtt_subscribe", {
+        filter,
+        listeners: subscribers ? subscribers.size : 0,
+        broker: redactUrl(MQTT_URL),
+      });
+    }
   });
 }
 
 function unsubscribeBrokerFilter(filter) {
   if (!mqttClient.connected) return;
   mqttClient.unsubscribe(filter, (error) => {
-    if (error) console.error(`MQTT unsubscribe failed for ${filter}:`, error.message);
-    else console.log(`Unsubscribed from ${filter}.`);
+    if (error) {
+      logError("mqtt_unsubscribe_failed", { filter, error: error.message });
+    } else {
+      logInfo("mqtt_unsubscribe", { filter, broker: redactUrl(MQTT_URL) });
+    }
   });
 }
 
@@ -616,6 +946,15 @@ function setSocketTopic(socket, filter) {
     topicSubscriptions.set(filter, subscribers);
   }
   subscribers.add(socket);
+  logInfo("socket_tune", {
+    socketId: socket.id,
+    user: socket.data.userEmail || "unknown",
+    userId: socket.data.userId,
+    ip: socketIp(socket),
+    from: previous || "-",
+    to: filter,
+    listeners: subscribers.size,
+  });
   if (subscribers.size === 1) subscribeBrokerFilter(filter);
 }
 
@@ -625,8 +964,24 @@ function clearSocketTopic(socket) {
   socket.data.topicFilter = null;
 
   const subscribers = topicSubscriptions.get(filter);
-  if (!subscribers) return;
+  if (!subscribers) {
+    logWarn("socket_untune_missing_subscription", {
+      socketId: socket.id,
+      user: socket.data.userEmail || "unknown",
+      userId: socket.data.userId,
+      filter,
+    });
+    return;
+  }
   subscribers.delete(socket);
+  logInfo("socket_untune", {
+    socketId: socket.id,
+    user: socket.data.userEmail || "unknown",
+    userId: socket.data.userId,
+    ip: socketIp(socket),
+    filter,
+    remaining: subscribers.size,
+  });
   if (subscribers.size === 0) {
     topicSubscriptions.delete(filter);
     unsubscribeBrokerFilter(filter);
@@ -634,19 +989,26 @@ function clearSocketTopic(socket) {
 }
 
 mqttClient.on("connect", () => {
-  console.log("Connected to Mosquitto.");
+  logInfo("mqtt_connected", {
+    broker: redactUrl(MQTT_URL),
+    restoredFilters: topicSubscriptions.size,
+  });
   // clean: true means subscriptions are lost on reconnect, so restore every
   // filter that an approved browser is currently tuned to.
   for (const filter of topicSubscriptions.keys()) subscribeBrokerFilter(filter);
   io.emit("mqtt-status", "connected");
 });
 
-mqttClient.on("reconnect", () => console.log("Reconnecting to Mosquitto..."));
+mqttClient.on("reconnect", () => logWarn("mqtt_reconnecting", { broker: redactUrl(MQTT_URL) }));
+mqttClient.on("offline", () => logWarn("mqtt_offline", { broker: redactUrl(MQTT_URL) }));
 mqttClient.on("error", (error) => {
-  console.error("MQTT error:", error.message);
+  logError("mqtt_error", { broker: redactUrl(MQTT_URL), error: error.message });
   io.emit("mqtt-status", "disconnected");
 });
-mqttClient.on("close", () => io.emit("mqtt-status", "disconnected"));
+mqttClient.on("close", () => {
+  logWarn("mqtt_disconnected", { broker: redactUrl(MQTT_URL) });
+  io.emit("mqtt-status", "disconnected");
+});
 
 // Mosquitto delivers one copy per matching subscription when the same client
 // has overlapping filters (for example "home/#" and "home/test"). Keep a very
@@ -677,34 +1039,84 @@ function isDuplicateBrokerMessage(topic, message) {
 
 // Route each broker message only to sockets whose tuned filter matches it.
 mqttClient.on("message", (topic, payload) => {
-  if (topicSubscriptions.size === 0) return;
   const message = payload.toString();
-  if (isDuplicateBrokerMessage(topic, message)) return;
+  const messageBytes = Buffer.byteLength(message);
+  if (topicSubscriptions.size === 0) {
+    logDebug("mqtt_message_no_listeners", {
+      topic,
+      bytes: messageBytes,
+      preview: previewText(message, 160),
+    });
+    return;
+  }
+  if (isDuplicateBrokerMessage(topic, message)) {
+    logDebug("mqtt_message_duplicate", {
+      topic,
+      bytes: messageBytes,
+      preview: previewText(message, 160),
+    });
+    return;
+  }
   const entry = {
     topic,
     message,
     receivedAt: new Date().toISOString(),
   };
 
+  const matchedFilters = [];
+  let recipients = 0;
   for (const [filter, subscribers] of topicSubscriptions) {
     if (!topicMatchesFilter(filter, topic)) continue;
-    for (const socket of subscribers) socket.emit("mqtt-message", entry);
+    matchedFilters.push(filter);
+    for (const socket of subscribers) {
+      socket.emit("mqtt-message", entry);
+      recipients += 1;
+    }
   }
+
+  logInfo("mqtt_message", {
+    topic,
+    bytes: messageBytes,
+    preview: previewText(message, 160),
+    matchedFilters: matchedFilters.length,
+    filters: matchedFilters.join(","),
+    recipients,
+  });
 });
 
 io.use(async (socket, next) => {
   const token =
     (socket.handshake.auth && (socket.handshake.auth.token || socket.handshake.auth.accessToken)) || "";
+  const authDetails = {
+    socketId: socket.id,
+    ip: socketIp(socket),
+    origin: socket.handshake.headers.origin || "-",
+    transport: socket.conn && socket.conn.transport ? socket.conn.transport.name : "unknown",
+  };
+
   if (typeof token !== "string" || token.length < 20) {
+    logWarn("socket_auth_rejected", { ...authDetails, reason: "missing_session_token" });
     return next(new Error("A sign-in session is required."));
   }
 
   try {
     const { user } = await loadSessionIdentity(token);
     socket.data.userId = user.id;
+    socket.data.userEmail = user.email || null;
     socket.data.role = user.role;
+    logDebug("socket_auth_success", {
+      ...authDetails,
+      user: userLabel(user),
+      userId: user.id,
+      role: user.role,
+    });
     return next();
   } catch (error) {
+    logWarn("socket_auth_rejected", {
+      ...authDetails,
+      status: error.statusCode || 503,
+      reason: error.message || "Could not authorize connection.",
+    });
     if (error.statusCode === 401) {
       return next(new Error("Your session is invalid or expired. Please sign in again."));
     }
@@ -716,6 +1128,17 @@ io.use(async (socket, next) => {
 });
 
 io.on("connection", (socket) => {
+  logInfo("socket_connect", {
+    socketId: socket.id,
+    user: socket.data.userEmail || "unknown",
+    userId: socket.data.userId,
+    role: socket.data.role,
+    ip: socketIp(socket),
+    origin: socket.handshake.headers.origin || "-",
+    transport: socket.conn && socket.conn.transport ? socket.conn.transport.name : "unknown",
+    ua: previewText(socket.handshake.headers["user-agent"] || "-", 120),
+  });
+
   socket.emit("mqtt-status", mqttClient.connected ? "connected" : "disconnected");
 
   // Every new listener starts on the "scan all" station.
@@ -725,11 +1148,26 @@ io.on("connection", (socket) => {
   socket.on("tune", (data, acknowledge) => {
     const reply = typeof acknowledge === "function" ? acknowledge : () => {};
     if (!data || typeof data.topic !== "string") {
+      logWarn("socket_tune_rejected", {
+        socketId: socket.id,
+        user: socket.data.userEmail || "unknown",
+        userId: socket.data.userId,
+        ip: socketIp(socket),
+        reason: "invalid_data",
+      });
       return reply({ ok: false, error: "Choose a topic filter first." });
     }
 
     const filter = data.topic.trim();
     if (!isValidTopicFilter(filter)) {
+      logWarn("socket_tune_rejected", {
+        socketId: socket.id,
+        user: socket.data.userEmail || "unknown",
+        userId: socket.data.userId,
+        ip: socketIp(socket),
+        reason: "invalid_filter",
+        filter,
+      });
       return reply({
         ok: false,
         error: "Use a topic filter such as home/kitchen/#, home/+/status, or home/test.",
@@ -741,12 +1179,28 @@ io.on("connection", (socket) => {
     return reply({ ok: true, topic: filter });
   });
 
-  socket.on("disconnect", () => clearSocketTopic(socket));
+  socket.on("disconnect", (reason) => {
+    logInfo("socket_disconnect", {
+      socketId: socket.id,
+      user: socket.data.userEmail || "unknown",
+      userId: socket.data.userId,
+      ip: socketIp(socket),
+      reason: reason || "unknown",
+    });
+    clearSocketTopic(socket);
+  });
 
   socket.on("publish-message", (data, acknowledge) => {
     const reply = typeof acknowledge === "function" ? acknowledge : () => {};
 
     if (!data || typeof data.topic !== "string" || typeof data.message !== "string") {
+      logWarn("socket_publish_rejected", {
+        socketId: socket.id,
+        user: socket.data.userEmail || "unknown",
+        userId: socket.data.userId,
+        ip: socketIp(socket),
+        reason: "invalid_data",
+      });
       return reply({ ok: false, error: "Invalid message data." });
     }
 
@@ -758,43 +1212,125 @@ io.on("connection", (socket) => {
       topic.endsWith("/") ||
       topic.length > 128
     ) {
+      logWarn("socket_publish_rejected", {
+        socketId: socket.id,
+        user: socket.data.userEmail || "unknown",
+        userId: socket.data.userId,
+        ip: socketIp(socket),
+        reason: "invalid_topic",
+        topic,
+      });
       return reply({ ok: false, error: "Use a valid topic such as home/test." });
     }
     if (message.length < 1 || message.length > 1000) {
+      logWarn("socket_publish_rejected", {
+        socketId: socket.id,
+        user: socket.data.userEmail || "unknown",
+        userId: socket.data.userId,
+        ip: socketIp(socket),
+        reason: "invalid_message_length",
+        topic,
+        length: message.length,
+      });
       return reply({ ok: false, error: "Message must contain 1–1000 characters." });
     }
     if (!mqttClient.connected) {
+      logWarn("socket_publish_rejected", {
+        socketId: socket.id,
+        user: socket.data.userEmail || "unknown",
+        userId: socket.data.userId,
+        ip: socketIp(socket),
+        reason: "mqtt_not_connected",
+        topic,
+      });
       return reply({ ok: false, error: "MQTT broker is not connected." });
     }
 
+    logInfo("socket_publish", {
+      socketId: socket.id,
+      user: socket.data.userEmail || "unknown",
+      userId: socket.data.userId,
+      ip: socketIp(socket),
+      topic,
+      bytes: Buffer.byteLength(message),
+      preview: previewText(message, 160),
+    });
+
     mqttClient.publish(topic, message, { qos: 0, retain: false }, (error) => {
-      if (error) return reply({ ok: false, error: "Publishing failed." });
+      if (error) {
+        logError("mqtt_publish_failed", {
+          socketId: socket.id,
+          user: socket.data.userEmail || "unknown",
+          userId: socket.data.userId,
+          topic,
+          bytes: Buffer.byteLength(message),
+          error: error.message,
+        });
+        return reply({ ok: false, error: "Publishing failed." });
+      }
+      logInfo("mqtt_publish", {
+        socketId: socket.id,
+        user: socket.data.userEmail || "unknown",
+        userId: socket.data.userId,
+        topic,
+        bytes: Buffer.byteLength(message),
+      });
       // This confirms MQTT accepted the publish; it does not prove a device acted on it.
       return reply({ ok: true });
     });
   });
 });
 
-app.use((error, _req, res, _next) => {
-  if (error.statusCode) {
-    return res.status(error.statusCode).json({ error: error.message });
+app.use((error, req, res, _next) => {
+  const status = error.statusCode || 500;
+  const details = {
+    id: req.logId,
+    method: req.method,
+    path: req.originalUrl || req.url,
+    status,
+    ip: requestIp(req),
+    user: req.identity ? userLabel(req.identity.user) : "anonymous",
+    userId: req.identity ? req.identity.user.id : undefined,
+    error: error.message || "Unknown error",
+  };
+
+  if (status >= 500) {
+    logError("http_error", { ...details, stack: error.stack });
+  } else {
+    logWarn("http_error", details);
   }
-  console.error("Unhandled API error:", error.message);
+
+  if (res.headersSent) return _next(error);
+  if (error.statusCode) {
+    return res.status(status).json({ error: error.message });
+  }
   return res.status(500).json({ error: "Internal server error." });
 });
 
+server.on("error", (error) => {
+  logError("server_error", { error: error.message, code: error.code });
+  process.exit(1);
+});
+
 server.listen(PORT, HOST, () => {
-  console.log(`Backend listening on http://${HOST}:${PORT}`);
-  console.log(`Static frontend directory: ${PUBLIC_DIR}`);
-  if (allowAllOrigins) console.log("CORS is open to all origins (ALLOWED_ORIGINS=*).");
-  else if (allowedOrigins.length) console.log(`CORS allowlist configured for ${allowedOrigins.length} origin(s).`);
+  logInfo("server_started", {
+    url: `http://${HOST}:${PORT}`,
+    node: process.version,
+    pid: process.pid,
+    publicDir: PUBLIC_DIR,
+    usersTable: USERS_TABLE,
+    sessionsTable: SESSIONS_TABLE,
+    mqttBroker: redactUrl(MQTT_URL),
+    cors: allowAllOrigins ? "*" : allowedOrigins.length,
+    logLevel: LOG_LEVEL_NAME,
+  });
 });
 
 let shuttingDown = false;
 function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
-  console.log(`${signal} received; shutting down...`);
+  logInfo("server_shutdown", { signal });
   io.close();
   mqttClient.end(false, {}, () => {
     server.close(() => process.exit(0));
