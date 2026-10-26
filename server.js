@@ -1,6 +1,7 @@
 require("dotenv").config();
 
 const crypto = require("crypto");
+const { EventEmitter } = require("events");
 const { promisify } = require("util");
 const express = require("express");
 const http = require("http");
@@ -9,6 +10,7 @@ const mqtt = require("mqtt");
 const cors = require("cors");
 const { Server } = require("socket.io");
 const { createClient } = require("@supabase/supabase-js");
+const { attachDeviceGateway } = require("./deviceGateway");
 
 const scrypt = promisify(crypto.scrypt);
 
@@ -58,6 +60,16 @@ const LOG_LEVEL = Object.prototype.hasOwnProperty.call(LOG_LEVELS, LOG_LEVEL_NAM
   ? LOG_LEVELS[LOG_LEVEL_NAME]
   : LOG_LEVELS.info;
 
+// Keep a small in-memory ring buffer for the admin log viewer. This is not a
+// replacement for a production log store; it is a live "tail" for this laptop.
+const LOG_BUFFER_LIMIT = Math.min(
+  Math.max(Number(process.env.LOG_BUFFER_LIMIT) || 1000, 100),
+  5000
+);
+const LOG_ROOM = "admin-logs";
+const logBuffer = [];
+const logEmitter = new EventEmitter();
+
 function logTimestamp() {
   return new Date().toISOString();
 }
@@ -82,11 +94,30 @@ function logValue(value) {
 
 function writeLog(level, event, details = {}) {
   if (LOG_LEVELS[level] < LOG_LEVEL) return;
-  const parts = [`[${logTimestamp()}]`, level.toUpperCase().padEnd(5), event];
+  const timestamp = logTimestamp();
+  const parts = [`[${timestamp}]`, level.toUpperCase().padEnd(5), event];
+  const entryDetails = {};
   for (const [key, value] of Object.entries(details)) {
-    if (value !== undefined) parts.push(`${key}=${logValue(value)}`);
+    if (value === undefined) continue;
+    parts.push(`${key}=${logValue(value)}`);
+    entryDetails[key] =
+      value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean"
+        ? value
+        : logValue(value);
   }
   const line = parts.join(" ");
+  const entry = { ts: timestamp, level, event, details: entryDetails, line };
+
+  logBuffer.push(entry);
+  if (logBuffer.length > LOG_BUFFER_LIMIT) {
+    logBuffer.splice(0, logBuffer.length - LOG_BUFFER_LIMIT);
+  }
+  try {
+    logEmitter.emit("entry", entry);
+  } catch (_error) {
+    // A log consumer must never take down the server.
+  }
+
   if (level === "error") console.error(line);
   else if (level === "warn") console.warn(line);
   else console.log(line);
@@ -106,6 +137,11 @@ function logWarn(event, details) {
 
 function logError(event, details) {
   writeLog("error", event, details);
+}
+
+function recentLogs(limit = 500) {
+  const count = Math.min(Math.max(Number(limit) || 500, 1), LOG_BUFFER_LIMIT);
+  return logBuffer.slice(-count);
 }
 
 function previewText(value, maxLength = 200) {
@@ -179,6 +215,10 @@ if (allowAllOrigins) {
 }
 const io = new Server(server, socketOptions);
 
+logEmitter.on("entry", (entry) => {
+  io.to(LOG_ROOM).emit("log-entry", entry);
+});
+
 // Supabase is used only as a database. There is no Supabase Auth or Supabase email flow.
 // This client exists only on the backend. Never send the service-role key to a browser.
 const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY, {
@@ -213,7 +253,12 @@ if (allowAllOrigins) {
   );
 }
 
-app.use(express.json({ limit: "16kb" }));
+app.use(express.json({
+  limit: "16kb",
+  verify(req, _res, buffer) {
+    req.rawBody = Buffer.from(buffer);
+  },
+}));
 
 // Log every HTTP request that reaches this machine, including Cloudflare-
 // forwarded API calls, static files, and Socket.IO polling transports.
@@ -802,6 +847,17 @@ app.get("/api/admin/users", authenticateHttp, requireAdmin, async (req, res, nex
   }
 });
 
+// A small JSON tail for scripts and for the /logs.html viewer's fallback.
+app.get("/api/admin/logs", authenticateHttp, requireAdmin, (req, res) => {
+  res.set("Cache-Control", "no-store");
+  return res.json({
+    logs: recentLogs(req.query.limit),
+    level: LOG_LEVEL_NAME,
+    buffered: logBuffer.length,
+    limit: LOG_BUFFER_LIMIT,
+  });
+});
+
 // Admins can approve or reject users, but cannot change anyone's role through this endpoint.
 app.patch(
   "/api/admin/users/:userId/approval",
@@ -900,6 +956,15 @@ const mqttClient = mqtt.connect(MQTT_URL, {
   reconnectPeriod: 3000,
   connectTimeout: 5000,
   clean: true,
+});
+
+const deviceGateway = attachDeviceGateway({
+  app,
+  server,
+  mqttClient,
+  logInfo,
+  logWarn,
+  logError,
 });
 
 // Each browser socket owns one topic filter. The backend keeps a reference
@@ -1104,6 +1169,7 @@ io.use(async (socket, next) => {
     socket.data.userId = user.id;
     socket.data.userEmail = user.email || null;
     socket.data.role = user.role;
+    socket.data.logsOnly = Boolean(socket.handshake.auth && socket.handshake.auth.logsOnly);
     logDebug("socket_auth_success", {
       ...authDetails,
       user: userLabel(user),
@@ -1133,6 +1199,7 @@ io.on("connection", (socket) => {
     user: socket.data.userEmail || "unknown",
     userId: socket.data.userId,
     role: socket.data.role,
+    logsOnly: socket.data.logsOnly || undefined,
     ip: socketIp(socket),
     origin: socket.handshake.headers.origin || "-",
     transport: socket.conn && socket.conn.transport ? socket.conn.transport.name : "unknown",
@@ -1141,9 +1208,41 @@ io.on("connection", (socket) => {
 
   socket.emit("mqtt-status", mqttClient.connected ? "connected" : "disconnected");
 
-  // Every new listener starts on the "scan all" station.
-  setSocketTopic(socket, DEFAULT_TOPIC_FILTER);
-  socket.emit("tuned", { topic: DEFAULT_TOPIC_FILTER });
+  // Admin-only live log tail. The browser asks for this explicitly so normal
+  // dashboard sockets never receive log traffic.
+  socket.on("subscribe-logs", (acknowledge) => {
+    const reply = typeof acknowledge === "function" ? acknowledge : () => {};
+    if (socket.data.role !== "admin") {
+      logWarn("logs_subscribe_denied", {
+        socketId: socket.id,
+        user: socket.data.userEmail || "unknown",
+        userId: socket.data.userId,
+        role: socket.data.role || "unknown",
+      });
+      return reply({ ok: false, error: "Administrator access is required." });
+    }
+
+    socket.join(LOG_ROOM);
+    logDebug("logs_subscribe", {
+      socketId: socket.id,
+      user: socket.data.userEmail || "unknown",
+      userId: socket.data.userId,
+    });
+    return reply({
+      ok: true,
+      logs: recentLogs(1000),
+      level: LOG_LEVEL_NAME,
+      buffered: logBuffer.length,
+      limit: LOG_BUFFER_LIMIT,
+    });
+  });
+
+  // The log viewer does not need an MQTT subscription. Dashboard sockets still
+  // start on the "scan all" station.
+  if (!socket.data.logsOnly) {
+    setSocketTopic(socket, DEFAULT_TOPIC_FILTER);
+    socket.emit("tuned", { topic: DEFAULT_TOPIC_FILTER });
+  }
 
   socket.on("tune", (data, acknowledge) => {
     const reply = typeof acknowledge === "function" ? acknowledge : () => {};
@@ -1331,6 +1430,7 @@ function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   logInfo("server_shutdown", { signal });
+  deviceGateway.close();
   io.close();
   mqttClient.end(false, {}, () => {
     server.close(() => process.exit(0));

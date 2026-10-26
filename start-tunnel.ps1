@@ -11,6 +11,7 @@ if (-not (Test-Path -LiteralPath $EnvPath)) {
     throw "Missing .env file at '$EnvPath'."
 }
 
+
 $Config = @{}
 
 foreach ($line in Get-Content -LiteralPath $EnvPath) {
@@ -34,12 +35,28 @@ foreach ($line in Get-Content -LiteralPath $EnvPath) {
 # 2. Load configuration
 # ------------------------------------------------------------
 
-$SupabaseUrl = $Config['SUPABASE_URL']
-$ServiceRoleKey = $Config['SUPABASE_SERVICE_ROLE_KEY']
+# The discovery row may live in a separate Supabase project. Prefer the
+# explicit DISCOVERY_* values used by the older bridge-only copy, then fall
+# back to the main SUPABASE_* values used by this project.
+$SupabaseUrl = $Config['DISCOVERY_SUPABASE_URL']
+if (-not $SupabaseUrl) {
+    $SupabaseUrl = $Config['SUPABASE_URL']
+}
+
+$ServiceRoleKey = $Config['DISCOVERY_SUPABASE_SERVICE_ROLE_KEY']
+if (-not $ServiceRoleKey) {
+    $ServiceRoleKey = $Config['SUPABASE_SERVICE_ROLE_KEY']
+}
+if (-not $ServiceRoleKey) {
+    $ServiceRoleKey = $Config['SUPABASE_SECRET_KEY']
+}
 
 $UserId = $Config['SUPABASE_TUNNEL_USER_ID']
 $Table = $Config['SUPABASE_TUNNEL_TABLE']
-$DiscoveryTable = $Config['SUPABASE_DISCOVERY_TABLE']
+$DiscoveryTable = $Config['DISCOVERY_TABLE']
+if (-not $DiscoveryTable) {
+    $DiscoveryTable = $Config['SUPABASE_DISCOVERY_TABLE']
+}
 
 $Port = $Config['PORT']
 if (-not $Port) {
@@ -49,18 +66,20 @@ if (-not $Port) {
 $LocalUrl = "http://127.0.0.1:$Port"
 
 if (-not $SupabaseUrl) {
-    throw 'SUPABASE_URL is missing from .env.'
+    throw 'DISCOVERY_SUPABASE_URL or SUPABASE_URL is missing from .env.'
 }
 
 $SupabaseUrl = $SupabaseUrl.TrimEnd('/')
 
 if (-not $ServiceRoleKey) {
-    throw 'SUPABASE_SERVICE_ROLE_KEY is missing from .env.'
+    throw 'DISCOVERY_SUPABASE_SERVICE_ROLE_KEY, SUPABASE_SERVICE_ROLE_KEY, or SUPABASE_SECRET_KEY is missing from .env.'
 }
 
-# Legacy service_role keys are JWTs and normally begin with eyJ.
-if (-not $ServiceRoleKey.StartsWith('eyJ')) {
-    throw 'SUPABASE_SERVICE_ROLE_KEY does not look like a legacy service_role JWT. Check that you copied the legacy service_role key, not a publishable or sb_secret key.'
+# Supabase projects may use either legacy JWT service_role keys or the newer
+# sb_secret server-only keys. Both are valid for the REST API; never use a
+# publishable/anon key here because this script updates app_discovery.
+if (-not ($ServiceRoleKey.StartsWith('eyJ') -or $ServiceRoleKey.StartsWith('sb_secret_'))) {
+    throw 'The server-only Supabase key must be a legacy service_role JWT or an sb_secret key.'
 }
 
 if (-not $UserId) {
@@ -80,7 +99,7 @@ if ($Table -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') {
 }
 
 if ($DiscoveryTable -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') {
-    throw 'SUPABASE_DISCOVERY_TABLE must be a simple table name.'
+    throw 'DISCOVERY_TABLE or SUPABASE_DISCOVERY_TABLE must be a simple table name.'
 }
 
 # ------------------------------------------------------------
@@ -103,7 +122,7 @@ $CloudflaredPath = $Cloudflared.Source
 # 4. Prepare Supabase REST API headers
 # ------------------------------------------------------------
 
-# Use the legacy service_role key for server-side database access.
+# Use a server-only Supabase key for database access.
 # Do not use this key in frontend JavaScript.
 $SupabaseHeaders = @{
     'apikey'        = $ServiceRoleKey
@@ -113,7 +132,7 @@ $SupabaseHeaders = @{
 }
 
 # ------------------------------------------------------------
-# 5. Update the existing device_tunnels row
+# 5. Update tunnel discovery rows
 # ------------------------------------------------------------
 
 function Update-TunnelRow([string]$TunnelUrl) {
@@ -148,8 +167,9 @@ function Update-TunnelRow([string]$TunnelUrl) {
     Write-Host "Tunnel URL: $($Rows[0].tunnel_url)"
 }
 
-# The static frontend reads this single row to discover the latest tunnel.
-# A failure here must not stop the MQTT backend or the tunnel itself.
+# app_discovery is the canonical row read by the Edge Function and ESP32.
+# The row must already exist; this script updates it whenever the tunnel URL
+# changes. The legacy device_tunnels row above is optional.
 function Update-DiscoveryRow([string]$BackendUrl) {
 
     $EncodedDiscoveryTable = [System.Uri]::EscapeDataString($DiscoveryTable)
@@ -259,20 +279,20 @@ while ($true) {
                 $LastSyncAttempt = Get-Date
 
                 try {
-                    Update-TunnelRow -TunnelUrl $TunnelUrl
-
-                    $Synced = $true
-
-                    Write-Host 'The tunnel URL was saved to Supabase.' -ForegroundColor Green
-                    Write-Host 'Your frontend can now retrieve the latest URL.' -ForegroundColor Green
-
+                    # app_discovery is the canonical row used by the Edge
+                    # Function and ESP32. device_tunnels is legacy/optional.
                     try {
-                        Update-DiscoveryRow -BackendUrl $TunnelUrl
+                        Update-TunnelRow -TunnelUrl $TunnelUrl
                     }
                     catch {
-                        Write-Host "[WARN] Tunnel works, but the discovery row was not updated: $($_.Exception.Message)" -ForegroundColor Yellow
-                        Write-Host 'Run sql/tunnel_discovery.sql and restart this script to publish the URL.' -ForegroundColor Yellow
+                        Write-Host "[WARN] Legacy device_tunnels row was not updated: $($_.Exception.Message)" -ForegroundColor Yellow
                     }
+
+                    Update-DiscoveryRow -BackendUrl $TunnelUrl
+                    $Synced = $true
+
+                    Write-Host 'The app_discovery tunnel URL was saved to Supabase.' -ForegroundColor Green
+                    Write-Host 'The Edge Function and ESP32 will use this URL on their next refresh.' -ForegroundColor Green
                 }
                 catch {
                     Write-Host "[ERROR] Could not update Supabase: $($_.Exception.Message)" -ForegroundColor Red

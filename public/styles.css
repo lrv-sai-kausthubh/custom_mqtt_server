@@ -66,3 +66,4 @@
 @media(max-width:900px){.radio-deck{grid-template-columns:1fr}.station-list{max-height:none}.custom-station{grid-template-columns:1fr 1fr}.custom-station .custom-grow{grid-column:1/-1}.custom-station .button{grid-column:1/-1;width:100%}}
 @media(max-width:690px){#frequency-value{font-size:52px}.tuner-card,.preset-card{padding:14px}.custom-station{grid-template-columns:1fr}.custom-station .custom-grow{grid-column:auto}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;animation:none!important;transition:none!important}}
+.admin-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}

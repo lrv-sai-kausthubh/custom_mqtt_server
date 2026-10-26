@@ -126,7 +126,7 @@
       </section>
 
       <section id="admin-panel" class="panel admin-panel hidden">
-        <div class="section-heading"><div><div class="card-kicker">ADMINISTRATION</div><h2>Access requests</h2><p class="muted">Review who can access the MQTT workspace.</p></div><button id="reload-users" class="button button-outline" type="button">↻ Refresh list</button></div>
+        <div class="section-heading"><div><div class="card-kicker">ADMINISTRATION</div><h2>Access requests</h2><p class="muted">Review who can access the MQTT workspace.</p></div><div class="admin-actions"><a id="open-logs" class="button button-outline" href="/logs.html" target="_blank" rel="noopener">Server logs</a><button id="reload-users" class="button button-outline" type="button">↻ Refresh list</button></div></div>
         <div class="admin-toolbar"><div class="stat-card"><span>Loaded accounts</span><strong id="stat-total">—</strong></div><div class="stat-card"><span>Pending review</span><strong id="stat-pending">—</strong></div><div class="stat-card"><span>Approved</span><strong id="stat-approved">—</strong></div><div class="filter-box"><label for="user-filter">Show</label><select id="user-filter"><option value="pending">Pending</option><option value="all">All accounts</option><option value="approved">Approved</option><option value="rejected">Rejected</option></select></div></div>
         <div id="admin-message" class="notice hidden" role="status" aria-live="polite"></div>
         <div class="table-wrap"><table><thead><tr><th>Account</th><th>Status</th><th>Requested</th><th>Last reviewed</th><th>Action</th></tr></thead><tbody id="users-table-body"><tr><td colspan="5" class="table-empty">Loading access requests…</td></tr></tbody></table></div>

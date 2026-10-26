@@ -18,7 +18,7 @@
     mqttPanel: $('#mqtt-panel'), brokerStatus: $('#broker-status'), publishForm: $('#publish-form'),
     topic: $('#topic'), message: $('#message'), publishButton: $('#publish-button'),
     publishMessage: $('#publish-message'), messageFeed: $('#message-feed'), clearFeed: $('#clear-feed'),
-    adminPanel: $('#admin-panel'), reloadUsers: $('#reload-users'), userFilter: $('#user-filter'),
+    adminPanel: $('#admin-panel'), openLogs: $('#open-logs'), reloadUsers: $('#reload-users'), userFilter: $('#user-filter'),
     usersTableBody: $('#users-table-body'), statTotal: $('#stat-total'), statPending: $('#stat-pending'),
     statApproved: $('#stat-approved'), adminMessage: $('#admin-message'), toast: $('#toast'),
     frequencyValue: $('#frequency-value'), frequencyDial: $('#frequency-dial'), stationName: $('#station-name'),
@@ -166,6 +166,8 @@
         'error'
       );
     }
+
+    if (elements.openLogs) elements.openLogs.href = `${backendUrl}/logs.html`;
   }
 
   function setupBackendSettings() {

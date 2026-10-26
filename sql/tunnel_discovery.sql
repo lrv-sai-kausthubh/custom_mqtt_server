@@ -1,8 +1,10 @@
 -- Run this in Supabase Dashboard -> SQL Editor.
--- Creates a single public row that the static frontend can read to discover the
--- latest Cloudflare Quick Tunnel URL. Only the backend URL is exposed.
+-- Creates a single public row that the static frontend, the mqtt-dispatch Edge
+-- Function and the ESP32 can read to discover the latest Cloudflare Quick
+-- Tunnel URL. Only the backend URL is exposed.
 --
--- start-tunnel.ps1 updates this row whenever it captures a new tunnel URL.
+-- app_discovery is the canonical discovery row. The legacy device_tunnels table
+-- is optional. start-tunnel.ps1 updates this row whenever it captures a new URL.
 
 create table if not exists public.app_discovery (
   id boolean primary key default true check (id),
@@ -31,3 +33,8 @@ create policy "Anyone can read the backend URL"
 -- update public.app_discovery
 -- set backend_url = 'https://your-current-tunnel.trycloudflare.com', updated_at = now()
 -- where id = true;
+
+-- The Edge Function and ESP32 should re-read backend_url when they reconnect,
+-- because Quick Tunnel URLs change whenever cloudflared restarts. No additional
+-- table is needed for the device gateway: relay commands travel over MQTT and
+-- the gateway keeps live sockets in memory.
