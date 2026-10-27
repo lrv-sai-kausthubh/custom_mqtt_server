@@ -144,6 +144,10 @@ Quick Tunnels are suitable for development; the URL changes on restart and anyon
 
 `public/index.html`, `public/styles.css`, `public/app.js`, `public/socket.io.min.js` and `public/config.js` are plain static files. Copy them to Vercel or any static host.
 
+The repository includes a root `vercel.json` that deploys only `public/` as a static site (`framework: null`, `outputDirectory: public`). Do not deploy `server.js` to Vercel as a function: it is a long-running Express/Socket.IO process that expects a local Mosquitto broker and in-memory state. The Vercel deployment is frontend-only; the backend stays on the laptop behind Cloudflare Tunnel. If the Vercel project was previously imported with a Node/Express preset, redeploy after this configuration is committed so Vercel stops creating a function for `server.js`.
+
+The static deployment has no `/api/*` routes. The browser sends API and Socket.IO traffic to the discovered tunnel URL, so test backend health against the tunnel, not against the Vercel domain.
+
 On startup the frontend finds the backend in this order:
 
 1. A backend URL saved in the browser's **Connection settings**.
